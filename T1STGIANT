@@ -1,0 +1,1195 @@
+
+-- T1ST GIANT v3
+-- Speed + STEAL NOW button (holds the "Steal" prompt using the hub's own hold/trigger method)
+-- + USE POTION button (equips Giant Potion from backpack and uses it).
+-- Nothing steals or drinks on inject. Only the buttons / keys (or the Auto toggle you switch on) do.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+if env.T1STGiantCleanup then
+	pcall(env.T1STGiantCleanup)
+end
+
+----------------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------------
+local CONFIG = {
+	PotionName = "Giant Potion",
+	StealWord = "steal",       -- prompt ActionText must contain this
+	HoldTime = 1.3,            -- server hold length for a steal
+	PotionDelay = 0.1,         -- seconds into the hold before the potion is drunk
+	Method = "hub",            -- "hub" = run the game's hold + trigger handlers (needs getconnections)
+	                           -- "hold" = plain prompt hold (InputHoldBegin / InputHoldEnd)
+	AutoCooldown = 0.2,        -- fallback path only (no getconnections): seconds between tries
+	MinSpeed = 0,
+	MaxSpeed = 60,
+	DefaultSpeed = 16,
+	MinRange = 5,
+	MaxRange = 60,
+	ToggleKey = Enum.KeyCode.RightShift, -- show / hide panel
+	PotionKey = Enum.KeyCode.H,          -- same as the USE POTION button
+}
+
+----------------------------------------------------------------------
+-- SETTINGS
+----------------------------------------------------------------------
+local FILE = "T1STGiant_v3.json"
+local settings = {
+	Speed = 30,
+	SpeedEnabled = true,
+	PotionWithSteal = true,
+	AutoSteal = false,
+	Range = 30,
+}
+
+local canFile = typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function"
+if canFile then
+	local ok, data = pcall(function()
+		if isfile(FILE) then
+			return HttpService:JSONDecode(readfile(FILE))
+		end
+	end)
+	if ok and type(data) == "table" then
+		for key, value in pairs(data) do
+			if settings[key] ~= nil and typeof(value) == typeof(settings[key]) then
+				settings[key] = value
+			end
+		end
+	end
+end
+settings.Speed = math.clamp(math.floor(settings.Speed), CONFIG.MinSpeed, CONFIG.MaxSpeed)
+settings.Range = math.clamp(math.floor(settings.Range), CONFIG.MinRange, CONFIG.MaxRange)
+settings.AutoSteal = false -- never auto-start on inject
+
+local saveQueued = false
+local function save()
+	if not canFile or saveQueued then
+		return
+	end
+	saveQueued = true
+	task.delay(0.5, function()
+		saveQueued = false
+		pcall(function()
+			writefile(FILE, HttpService:JSONEncode(settings))
+		end)
+	end)
+end
+
+----------------------------------------------------------------------
+-- LIFECYCLE
+----------------------------------------------------------------------
+local alive = true
+local conns = {}
+local gui
+local currentHum
+local speedConn
+
+local function track(conn)
+	conns[#conns + 1] = conn
+	return conn
+end
+
+local function cleanup()
+	if not alive then
+		return
+	end
+	alive = false
+	for _, conn in ipairs(conns) do
+		pcall(function() conn:Disconnect() end)
+	end
+	table.clear(conns)
+	if speedConn then
+		pcall(function() speedConn:Disconnect() end)
+		speedConn = nil
+	end
+	if currentHum and currentHum.Parent then
+		currentHum.WalkSpeed = CONFIG.DefaultSpeed
+	end
+	if gui then
+		gui:Destroy()
+	end
+	if env.T1STGiantCleanup == cleanup then
+		env.T1STGiantCleanup = nil
+	end
+end
+env.T1STGiantCleanup = cleanup
+
+local setStatus = function() end
+local setProgress = function() end
+
+----------------------------------------------------------------------
+-- SPEED
+----------------------------------------------------------------------
+local function applySpeed()
+	if currentHum and currentHum.Parent and settings.SpeedEnabled then
+		if currentHum.WalkSpeed ~= settings.Speed then
+			currentHum.WalkSpeed = settings.Speed
+		end
+	end
+end
+
+local function bindHumanoid(hum)
+	currentHum = hum
+	if speedConn then
+		speedConn:Disconnect()
+	end
+	speedConn = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(applySpeed)
+	applySpeed()
+end
+
+local function onCharacter(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if hum and alive then
+		bindHumanoid(hum)
+	end
+end
+
+track(player.CharacterAdded:Connect(onCharacter))
+if player.Character then
+	task.spawn(onCharacter, player.Character)
+end
+
+local function isCarrying()
+	local v = player:GetAttribute("Stealing")
+	return v ~= nil and v ~= false
+end
+
+----------------------------------------------------------------------
+-- POTION (equip from backpack, then use)
+----------------------------------------------------------------------
+local function normalize(text)
+	return (string.lower(text):gsub("[%s_%-]", ""))
+end
+local potionKey = normalize(CONFIG.PotionName)
+
+local function findPotionIn(container)
+	if not container then
+		return nil
+	end
+	local exact = container:FindFirstChild(CONFIG.PotionName)
+	if exact and exact:IsA("Tool") then
+		return exact
+	end
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") and string.find(normalize(child.Name), potionKey, 1, true) then
+			return child
+		end
+	end
+	return nil
+end
+
+local function getPotion()
+	return findPotionIn(player.Character) or findPotionIn(player:FindFirstChildOfClass("Backpack"))
+end
+
+local potionBusy = false
+local function drinkPotion()
+	if potionBusy then
+		return false
+	end
+	local char = player.Character
+	local hum = currentHum
+	local potion = getPotion()
+	if not (char and hum and hum.Health > 0) then
+		return false
+	end
+	if not potion then
+		setStatus("no " .. CONFIG.PotionName .. " in inventory")
+		return false
+	end
+
+	potionBusy = true
+	local previous
+	for _, child in ipairs(char:GetChildren()) do
+		if child:IsA("Tool") and child ~= potion then
+			previous = child
+			break
+		end
+	end
+
+	if potion.Parent ~= char then
+		pcall(function() hum:EquipTool(potion) end)
+		local waited = 0
+		while potion.Parent ~= char and waited < 1 do
+			waited += task.wait(0.05)
+		end
+	end
+
+	local used = false
+	if potion.Parent == char then
+		used = pcall(function() potion:Activate() end)
+		setStatus(used and (CONFIG.PotionName .. " used") or "activate failed")
+	else
+		setStatus("could not equip potion")
+	end
+
+	task.wait(0.3)
+	if previous and previous.Parent and hum.Health > 0 and previous.Parent ~= char then
+		pcall(function() hum:EquipTool(previous) end)
+	end
+	potionBusy = false
+	return used
+end
+
+----------------------------------------------------------------------
+-- STEAL PROMPTS
+----------------------------------------------------------------------
+local prompts = {}
+local function register(inst)
+	if inst:IsA("ProximityPrompt") then
+		prompts[inst] = true
+	end
+end
+track(workspace.DescendantAdded:Connect(register))
+track(workspace.DescendantRemoving:Connect(function(inst)
+	prompts[inst] = nil
+end))
+task.spawn(function()
+	local count = 0
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if not alive then
+			return
+		end
+		register(inst)
+		count += 1
+		if count % 1500 == 0 then
+			task.wait()
+		end
+	end
+end)
+
+local function promptPosition(prompt)
+	local parent = prompt.Parent
+	if not parent then
+		return nil
+	end
+	if parent:IsA("Attachment") then
+		return parent.WorldPosition
+	elseif parent:IsA("BasePart") then
+		return parent.Position
+	elseif parent:IsA("Model") then
+		return parent:GetPivot().Position
+	end
+	local part = parent:FindFirstAncestorWhichIsA("BasePart")
+	return part and part.Position or nil
+end
+
+local function isStealPrompt(prompt)
+	return string.find(string.lower(prompt.ActionText), CONFIG.StealWord, 1, true) ~= nil
+end
+
+-- nearest enabled "Steal" prompt inside range
+local function findStealPrompt()
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return nil
+	end
+	local best, bestDist = nil, math.huge
+	for prompt in pairs(prompts) do
+		if prompt.Parent and prompt.Enabled and isStealPrompt(prompt) then
+			local pos = promptPosition(prompt)
+			if pos then
+				local dist = (pos - root.Position).Magnitude
+				if dist <= settings.Range and dist < bestDist then
+					best, bestDist = prompt, dist
+				end
+			end
+		end
+	end
+	return best, bestDist
+end
+
+-- The game's own prompt handlers (same trick the hub uses).
+-- hold   = what runs when you start holding the Steal button
+-- trigger = what runs when the hold completes
+local handlerCache = setmetatable({}, { __mode = "k" })
+local function getHandlers(prompt)
+	local cached = handlerCache[prompt]
+	if cached and #cached.trigger > 0 then
+		return cached
+	end
+	local h = { hold = {}, trigger = {} }
+	if typeof(getconnections) == "function" then
+		pcall(function()
+			for _, c in ipairs(getconnections(prompt.PromptButtonHoldBegan)) do
+				local f = c.Function
+				if type(f) == "function" then
+					local src = ""
+					pcall(function() src = debug.info(f, "s") or "" end)
+					-- PlotClient's own hold handler only greys out the other podiums, skip it
+					if not (src:find("PlotClient", 1, true) and not src:find("AnimalPrompt", 1, true)) then
+						h.hold[#h.hold + 1] = f
+					end
+				end
+			end
+			for _, c in ipairs(getconnections(prompt.Triggered)) do
+				if type(c.Function) == "function" then
+					h.trigger[#h.trigger + 1] = c.Function
+				end
+			end
+		end)
+	end
+	handlerCache[prompt] = h
+	return h
+end
+
+local busy = false
+local function steal(prompt, withPotion)
+	if busy or not prompt or not prompt.Parent then
+		return false
+	end
+	busy = true
+
+	local name = prompt.ObjectText ~= "" and prompt.ObjectText or "brainrot"
+	setStatus("holding Steal: " .. name)
+	pcall(function() prompt.RequiresLineOfSight = false end)
+
+	local h = getHandlers(prompt)
+	local useHub = CONFIG.Method == "hub" and #h.hold > 0 and #h.trigger > 0
+	local need = math.max(prompt.HoldDuration, CONFIG.HoldTime)
+
+	-- press and hold
+	if useHub then
+		for _, f in ipairs(h.hold) do
+			task.spawn(pcall, f, player)
+		end
+	else
+		pcall(function() prompt:InputHoldBegin() end)
+	end
+
+	local started = os.clock()
+	local drank = false
+	local aborted = false
+	while os.clock() - started < need + 0.05 do
+		local char = player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local pos = prompt.Parent and promptPosition(prompt)
+		if not alive or not root or not pos or (pos - root.Position).Magnitude > settings.Range + 15 then
+			aborted = true
+			break
+		end
+		setProgress(math.clamp((os.clock() - started) / need, 0, 1))
+		if withPotion and not drank and os.clock() - started >= CONFIG.PotionDelay then
+			drank = true
+			task.spawn(drinkPotion)
+		end
+		if isCarrying() then
+			break
+		end
+		task.wait()
+	end
+
+	-- release / finish
+	if not aborted and not isCarrying() and prompt.Parent then
+		if useHub then
+			for _, f in ipairs(h.trigger) do
+				task.spawn(pcall, f, player)
+			end
+		end
+	end
+	if not useHub then
+		pcall(function() prompt:InputHoldEnd() end)
+	end
+
+	-- confirm via the game's Stealing flag
+	local got = isCarrying()
+	if not got and not aborted then
+		local t0 = os.clock()
+		while os.clock() - t0 < 1.2 do
+			if isCarrying() then
+				got = true
+				break
+			end
+			task.wait(0.05)
+		end
+	end
+
+	if got then
+		setProgress(1)
+		setStatus("stolen: " .. name)
+		task.delay(1.2, function()
+			if not busy then
+				setProgress(0)
+			end
+		end)
+	elseif aborted then
+		setProgress(0)
+		setStatus("steal cancelled (out of range)")
+	else
+		setProgress(0)
+		setStatus("steal failed, try again")
+	end
+	busy = false
+	return got
+end
+
+local function stealNow()
+	if busy then
+		return
+	end
+	if isCarrying() then
+		setStatus("already carrying one")
+		return
+	end
+	local prompt = findStealPrompt()
+	if not prompt then
+		setStatus("no Steal prompt within " .. settings.Range .. " studs")
+		return
+	end
+	task.spawn(steal, prompt, settings.PotionWithSteal)
+end
+
+local function potionNow()
+	task.spawn(drinkPotion)
+end
+
+----------------------------------------------------------------------
+-- FAST AUTO STEAL (banked hold)
+-- The server needs a 1.3s hold that began in range. So instead of starting the hold when you
+-- arrive, a hold is kept "banked" while you are near a Steal prompt (re-begun before the server
+-- drops it at ~2.6s). The moment you are inside range the grab fires, no waiting.
+----------------------------------------------------------------------
+local ARM_EXTRA, MAX_AGE = 10, 2.4
+local stealList, stealListAt = {}, 0
+local bankAt, bankPrompt = 0, nil
+local lastFire, lastFallback = 0, 0
+local potionDone = false
+local wasCarrying = false
+
+local function refreshStealList()
+	table.clear(stealList)
+	for prompt in pairs(prompts) do
+		if prompt.Parent and isStealPrompt(prompt) then
+			stealList[#stealList + 1] = prompt
+		end
+	end
+end
+
+track(RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	local carrying = isCarrying()
+	if carrying ~= wasCarrying then
+		wasCarrying = carrying
+		if carrying then
+			bankPrompt = nil
+			setProgress(1)
+			setStatus("stolen!")
+			task.delay(1, function()
+				if not isCarrying() then
+					setProgress(0)
+				end
+			end)
+		else
+			potionDone = false
+		end
+	end
+
+	if not settings.AutoSteal then
+		bankPrompt = nil
+		return
+	end
+	if carrying or busy then
+		return
+	end
+
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	if now - stealListAt > 1 then
+		stealListAt = now
+		refreshStealList()
+	end
+
+	local range = settings.Range
+	local target, targetDist = nil, math.huge
+	local arm, armDist = nil, range + ARM_EXTRA
+	for _, p in ipairs(stealList) do
+		if p.Parent and p.Enabled then
+			local pos = promptPosition(p)
+			if pos then
+				local d = (pos - root.Position).Magnitude
+				if d <= armDist then
+					arm, armDist = p, d
+				end
+				if d <= range and d < targetDist then
+					target, targetDist = p, d
+				end
+			end
+		end
+	end
+
+	if not arm then
+		if bankPrompt then
+			bankPrompt = nil
+			setProgress(0)
+		end
+		return
+	end
+
+	local h = getHandlers(arm)
+	if #h.hold == 0 or #h.trigger == 0 then
+		-- no getconnections: plain prompt hold, retried quickly
+		if target and now - lastFallback > CONFIG.AutoCooldown then
+			lastFallback = now
+			task.spawn(steal, target, settings.PotionWithSteal)
+		end
+		return
+	end
+
+	-- keep a hold banked so it is ripe on arrival
+	local age = bankPrompt and (now - bankAt) or math.huge
+	local eta = 0
+	if not target then
+		local pos = promptPosition(arm)
+		local dir = pos and (pos - root.Position) or Vector3.zero
+		local toward = dir.Magnitude > 0 and root.AssemblyLinearVelocity:Dot(dir.Unit) or 0
+		eta = math.max(armDist - range, 0) / math.max(toward, 8)
+	end
+	if bankPrompt == nil or age + eta > MAX_AGE then
+		pcall(function() arm.RequiresLineOfSight = false end)
+		for _, f in ipairs(h.hold) do
+			task.spawn(pcall, f, player)
+		end
+		bankAt, bankPrompt = now, arm
+		age = 0
+	end
+
+	local need = math.max(arm.HoldDuration, CONFIG.HoldTime) + 0.03
+	setProgress(math.min(age / need, 1))
+	if not target then
+		setStatus(string.format("approaching, hold banked (%.0f studs)", armDist))
+		return
+	end
+
+	if settings.PotionWithSteal and not potionDone and age >= need * 0.5 then
+		potionDone = true
+		task.spawn(drinkPotion)
+	end
+
+	if age >= need and age <= MAX_AGE + 0.3 and now - lastFire >= 0.1 then
+		lastFire = now
+		local th = getHandlers(target)
+		for _, f in ipairs(th.trigger) do
+			task.spawn(pcall, f, player)
+		end
+		setStatus("grabbing " .. (target.ObjectText ~= "" and target.ObjectText or "brainrot"))
+	end
+end))
+
+----------------------------------------------------------------------
+-- GUI (hub style)
+----------------------------------------------------------------------
+local T = {
+	BG = Color3.fromRGB(5, 6, 9),
+	SURF = Color3.fromRGB(13, 15, 20),
+	SURF2 = Color3.fromRGB(22, 25, 32),
+	HOVER = Color3.fromRGB(34, 39, 48),
+	TEXT = Color3.fromRGB(242, 247, 255),
+	DIM = Color3.fromRGB(155, 170, 188),
+	ACCENT = Color3.fromRGB(165, 215, 255),
+	ACCENT2 = Color3.fromRGB(85, 145, 195),
+	STROKE = Color3.fromRGB(105, 165, 215),
+	GREEN1 = Color3.fromRGB(18, 88, 58),
+	GREEN2 = Color3.fromRGB(21, 120, 76),
+	GREEN_STROKE = Color3.fromRGB(60, 185, 120),
+	ON_TEXT = Color3.fromRGB(232, 255, 240),
+	OFF_BG = Color3.fromRGB(34, 39, 48),
+	OFF_TEXT = Color3.fromRGB(135, 150, 168),
+	TRACK = Color3.fromRGB(15, 18, 24),
+	TRACK2 = Color3.fromRGB(27, 32, 41),
+	FILL1 = Color3.fromRGB(100, 165, 220),
+	FILL2 = Color3.fromRGB(220, 240, 255),
+	GOOD = Color3.fromRGB(110, 235, 160),
+	BAD = Color3.fromRGB(255, 110, 130),
+}
+
+local function corner(obj, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = obj
+	return c
+end
+
+local function stroke(obj, color, thickness, transparency)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = obj
+	return s
+end
+
+local function gradient(obj, c1, c2, rotation)
+	local g = Instance.new("UIGradient")
+	g.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, c1), ColorSequenceKeypoint.new(1, c2) })
+	g.Rotation = rotation or 0
+	g.Parent = obj
+	return g
+end
+
+local function addShadow(obj, pad, transparency)
+	local s = Instance.new("ImageLabel")
+	s.Name = "Shadow"
+	s.AnchorPoint = Vector2.new(0.5, 0.5)
+	s.Position = UDim2.new(0.5, 0, 0.5, 2)
+	s.Size = UDim2.new(1, pad or 24, 1, pad or 24)
+	s.BackgroundTransparency = 1
+	s.Image = "rbxassetid://6014261993"
+	s.ImageColor3 = Color3.new(0, 0, 0)
+	s.ImageTransparency = transparency or 0.72
+	s.ScaleType = Enum.ScaleType.Slice
+	s.SliceCenter = Rect.new(49, 49, 450, 450)
+	s.ZIndex = 1
+	s.Parent = obj
+	return s
+end
+
+local function label(parent, text, size, color, font, align)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextSize = size
+	l.TextColor3 = color or T.TEXT
+	l.Font = font or Enum.Font.GothamBold
+	l.TextXAlignment = align or Enum.TextXAlignment.Left
+	l.ZIndex = 2
+	l.Parent = parent
+	return l
+end
+
+local function isPointer(i)
+	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+local function isMove(i)
+	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local function makeDraggable(handle, target)
+	local dragging, dragStart, startPos = false, nil, nil
+	track(handle.InputBegan:Connect(function(i)
+		if isPointer(i) then
+			dragging, dragStart, startPos = true, i.Position, target.Position
+		end
+	end))
+	track(UIS.InputChanged:Connect(function(i)
+		if dragging and isMove(i) then
+			local d = i.Position - dragStart
+			target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	track(UIS.InputEnded:Connect(function(i)
+		if isPointer(i) then
+			dragging = false
+		end
+	end))
+end
+
+gui = Instance.new("ScreenGui")
+gui.Name = "T1STGIANT"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+do
+	local okH, hui = pcall(function() return gethui() end)
+	gui.Parent = (okH and typeof(hui) == "Instance") and hui or player:WaitForChild("PlayerGui")
+end
+
+local panelWidth = UIS.TouchEnabled and 276 or 262
+
+----------------------------------------------------------------------
+-- Main window
+----------------------------------------------------------------------
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(panelWidth, 380)
+main.AnchorPoint = Vector2.new(1, 0)
+main.Position = UIS.TouchEnabled and UDim2.new(0.88, 0, 0.05, 0) or UDim2.new(0.84, 0, 0.04, 0)
+main.BackgroundColor3 = T.BG
+main.BorderSizePixel = 0
+main.Active = true
+main.ZIndex = 2
+main.Parent = gui
+corner(main, 18)
+stroke(main, T.STROKE, 1.2, 0.4)
+addShadow(main)
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 36)
+header.BackgroundTransparency = 1
+header.ZIndex = 2
+header.Parent = main
+makeDraggable(header, main)
+
+local title = label(header, "T1ST GIANT", 18, T.TEXT, Enum.Font.GothamBlack)
+title.Size = UDim2.new(1, -90, 0, 22)
+title.Position = UDim2.fromOffset(14, 7)
+
+local rule = Instance.new("Frame")
+rule.AnchorPoint = Vector2.new(0.5, 0)
+rule.Position = UDim2.new(0.5, 0, 0, 34)
+rule.Size = UDim2.new(0, 124, 0, 1)
+rule.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+rule.BackgroundTransparency = 0.15
+rule.BorderSizePixel = 0
+rule.ZIndex = 2
+rule.Parent = main
+
+local function headerButton(text, xOffset)
+	local b = Instance.new("TextButton")
+	b.AutoButtonColor = false
+	b.Size = UDim2.fromOffset(24, 24)
+	b.Position = UDim2.new(1, xOffset, 0, 6)
+	b.BackgroundColor3 = T.SURF2
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.TextColor3 = T.TEXT
+	b.Font = Enum.Font.GothamBlack
+	b.TextSize = 13
+	b.ZIndex = 3
+	b.Parent = header
+	corner(b, 8)
+	local s = stroke(b, T.STROKE, 1, 0.55)
+	b.MouseEnter:Connect(function() s.Transparency = 0.12 end)
+	b.MouseLeave:Connect(function() s.Transparency = 0.55 end)
+	return b
+end
+local minBtn = headerButton("-", -58)
+local closeBtn = headerButton("X", -30)
+
+local body = Instance.new("ScrollingFrame")
+body.Position = UDim2.fromOffset(6, 42)
+body.Size = UDim2.new(1, -12, 1, -50)
+body.BackgroundTransparency = 1
+body.BorderSizePixel = 0
+body.ScrollBarThickness = 3
+body.ScrollBarImageColor3 = T.STROKE
+body.CanvasSize = UDim2.new()
+body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+body.ScrollingDirection = Enum.ScrollingDirection.Y
+body.ZIndex = 2
+body.Parent = main
+
+local bodyPad = Instance.new("UIPadding")
+bodyPad.PaddingLeft = UDim.new(0, 4)
+bodyPad.PaddingRight = UDim.new(0, 8)
+bodyPad.PaddingTop = UDim.new(0, 2)
+bodyPad.PaddingBottom = UDim.new(0, 8)
+bodyPad.Parent = body
+
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 6)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = body
+
+local order = 0
+local function nextOrder()
+	order += 1
+	return order
+end
+
+local function card(height)
+	local c = Instance.new("Frame")
+	c.Size = UDim2.new(1, 0, 0, height)
+	c.BackgroundColor3 = T.SURF2
+	c.BorderSizePixel = 0
+	c.LayoutOrder = nextOrder()
+	c.ZIndex = 2
+	c.Parent = body
+	corner(c, 11)
+	stroke(c, T.STROKE, 1, 0.52)
+	return c
+end
+
+----------------------------------------------------------------------
+-- Open / close
+----------------------------------------------------------------------
+local openBtn = Instance.new("TextButton")
+openBtn.AutoButtonColor = false
+openBtn.Size = UDim2.fromOffset(50, 50)
+openBtn.Position = UDim2.new(0, 12, 0.5, -25)
+openBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+openBtn.BorderSizePixel = 0
+openBtn.Text = "T1ST"
+openBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+openBtn.TextStrokeTransparency = 0.6
+openBtn.Font = Enum.Font.GothamBlack
+openBtn.TextSize = 13
+openBtn.Visible = false
+openBtn.ZIndex = 5
+openBtn.Parent = gui
+corner(openBtn, 14)
+gradient(openBtn, T.FILL1, T.ACCENT2, 90)
+stroke(openBtn, Color3.fromRGB(195, 230, 255), 1, 0.45)
+
+local function setOpen(open)
+	main.Visible = open
+	openBtn.Visible = not open
+end
+track(minBtn.MouseButton1Click:Connect(function() setOpen(false) end))
+track(openBtn.MouseButton1Click:Connect(function() setOpen(true) end))
+track(closeBtn.MouseButton1Click:Connect(cleanup))
+
+----------------------------------------------------------------------
+-- Steal bar (big, always visible, draggable)
+----------------------------------------------------------------------
+local bar = Instance.new("Frame")
+bar.AnchorPoint = Vector2.new(0.5, 1)
+bar.Size = UDim2.fromOffset(320, 64)
+bar.Position = UDim2.new(0.5, 0, 1, -130)
+bar.BackgroundColor3 = T.SURF
+bar.BackgroundTransparency = 0.02
+bar.BorderSizePixel = 0
+bar.Active = true
+bar.ZIndex = 2
+bar.Parent = gui
+corner(bar, 14)
+stroke(bar, T.STROKE, 1, 0.35)
+stroke(bar, T.ACCENT, 3, 0.84)
+addShadow(bar, 20)
+makeDraggable(bar, bar)
+
+local barTitle = label(bar, "T1ST GIANT", 13, T.TEXT, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+barTitle.Size = UDim2.new(1, -16, 0, 18)
+barTitle.Position = UDim2.fromOffset(8, 5)
+barTitle.TextTruncate = Enum.TextTruncate.AtEnd
+
+local barTrack = Instance.new("Frame")
+barTrack.Size = UDim2.new(1, -16, 0, 26)
+barTrack.Position = UDim2.fromOffset(8, 28)
+barTrack.BackgroundColor3 = T.TRACK
+barTrack.BorderSizePixel = 0
+barTrack.ZIndex = 3
+barTrack.Parent = bar
+corner(barTrack, 10)
+stroke(barTrack, T.STROKE, 1, 0.55)
+
+local barInner = Instance.new("Frame")
+barInner.Size = UDim2.new(1, -2, 1, -2)
+barInner.Position = UDim2.fromOffset(1, 1)
+barInner.BackgroundColor3 = T.TRACK2
+barInner.BackgroundTransparency = 0.15
+barInner.BorderSizePixel = 0
+barInner.ZIndex = 3
+barInner.Parent = barTrack
+corner(barInner, 9)
+
+local barFill = Instance.new("Frame")
+barFill.Size = UDim2.new(0, 0, 1, 0)
+barFill.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+barFill.BorderSizePixel = 0
+barFill.ZIndex = 4
+barFill.Parent = barTrack
+corner(barFill, 10)
+gradient(barFill, T.FILL1, T.FILL2, 0)
+stroke(barFill, Color3.fromRGB(195, 230, 255), 1, 0.45)
+
+local barPercent = label(barTrack, "0%", 14, T.TEXT, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+barPercent.Size = UDim2.fromScale(1, 1)
+barPercent.TextStrokeTransparency = 0.7
+barPercent.ZIndex = 5
+
+setProgress = function(p)
+	p = math.clamp(p or 0, 0, 1)
+	barFill.Size = UDim2.new(p, 0, 1, 0)
+	barPercent.Text = math.floor(p * 100 + 0.5) .. "%"
+end
+
+----------------------------------------------------------------------
+-- Controls
+----------------------------------------------------------------------
+local statusCard = card(34)
+local statusLabel = label(statusCard, "ready. flip AUTO STEAL to start.", 11, T.DIM, Enum.Font.GothamBold)
+statusLabel.Size = UDim2.new(1, -20, 1, 0)
+statusLabel.Position = UDim2.fromOffset(10, 0)
+statusLabel.TextWrapped = true
+
+setStatus = function(text)
+	local low = string.lower(text)
+	local color = T.TEXT
+	if low:find("stolen", 1, true) or low:find("used", 1, true) or low:find("armed", 1, true) then
+		color = T.GOOD
+	elseif low:find("fail", 1, true) or low:find("cancel", 1, true) or low:find("no ", 1, true) or low:find("could not", 1, true) then
+		color = T.BAD
+	end
+	if statusLabel and statusLabel.Parent then
+		statusLabel.Text = text
+		statusLabel.TextColor3 = color == T.TEXT and T.DIM or color
+	end
+	if barTitle and barTitle.Parent then
+		barTitle.Text = text
+		barTitle.TextColor3 = color
+	end
+end
+
+local function makeToggle(text, initial, onChange)
+	local c = card(34)
+	local l = label(c, text, 12, T.TEXT, Enum.Font.GothamBold)
+	l.Size = UDim2.new(0.62, 0, 1, 0)
+	l.Position = UDim2.fromOffset(12, 0)
+
+	local btn = Instance.new("TextButton")
+	btn.AutoButtonColor = false
+	btn.Size = UDim2.fromOffset(62, 22)
+	btn.Position = UDim2.new(1, -70, 0.5, -11)
+	btn.BackgroundColor3 = T.OFF_BG
+	btn.BorderSizePixel = 0
+	btn.Text = ""
+	btn.ZIndex = 3
+	btn.Parent = c
+	corner(btn, 7)
+	local btnStroke = stroke(btn, T.STROKE, 1, 0.55)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.new(1, 0, 1, 0)
+	knob.BackgroundTransparency = 1
+	knob.BorderSizePixel = 0
+	knob.ZIndex = 3
+	knob.Parent = btn
+	corner(knob, 7)
+	gradient(knob, T.GREEN1, T.GREEN2)
+
+	local stateLabel = label(btn, "", 11, T.OFF_TEXT, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+	stateLabel.Size = UDim2.fromScale(1, 1)
+	stateLabel.ZIndex = 4
+
+	local state = initial and true or false
+	local function paint()
+		if state then
+			btn.BackgroundColor3 = T.GREEN1
+			knob.BackgroundTransparency = 0
+			stateLabel.Text = "ON"
+			stateLabel.TextColor3 = T.ON_TEXT
+			btnStroke.Color = T.GREEN_STROKE
+			btnStroke.Transparency = 0.22
+		else
+			btn.BackgroundColor3 = T.OFF_BG
+			knob.BackgroundTransparency = 1
+			stateLabel.Text = "OFF"
+			stateLabel.TextColor3 = T.OFF_TEXT
+			btnStroke.Color = T.STROKE
+			btnStroke.Transparency = 0.55
+		end
+	end
+	paint()
+
+	track(btn.MouseButton1Click:Connect(function()
+		state = not state
+		paint()
+		onChange(state)
+	end))
+end
+
+local function primaryButton(text, callback)
+	local holder = Instance.new("Frame")
+	holder.Size = UDim2.new(1, 0, 0, 40)
+	holder.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	holder.BorderSizePixel = 0
+	holder.LayoutOrder = nextOrder()
+	holder.ZIndex = 2
+	holder.Parent = body
+	corner(holder, 11)
+	gradient(holder, T.FILL1, T.ACCENT2, 90)
+	stroke(holder, Color3.fromRGB(195, 230, 255), 1, 0.45)
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 1, 0)
+	btn.AutoButtonColor = false
+	btn.BackgroundTransparency = 1
+	btn.Text = text
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.TextStrokeTransparency = 0.6
+	btn.Font = Enum.Font.GothamBlack
+	btn.TextSize = 14
+	btn.ZIndex = 3
+	btn.Parent = holder
+	track(btn.MouseButton1Click:Connect(callback))
+end
+
+-- slider card: title row (+ optional number box) and a track
+local function sliderCard(text, min, max, initial, onChange, withBox)
+	local c = card(52)
+	local l = label(c, text, 12, T.TEXT, Enum.Font.GothamBold)
+	l.Size = UDim2.new(1, -90, 0, 20)
+	l.Position = UDim2.fromOffset(12, 5)
+
+	local box
+	if withBox then
+		box = Instance.new("TextBox")
+		box.Size = UDim2.fromOffset(56, 20)
+		box.Position = UDim2.new(1, -66, 0, 5)
+		box.BackgroundColor3 = T.OFF_BG
+		box.BorderSizePixel = 0
+		box.TextColor3 = T.TEXT
+		box.Font = Enum.Font.GothamBold
+		box.TextSize = 12
+		box.ClearTextOnFocus = false
+		box.Text = tostring(initial)
+		box.ZIndex = 3
+		box.Parent = c
+		corner(box, 7)
+		stroke(box, T.STROKE, 1, 0.55)
+	end
+
+	local trackBar = Instance.new("Frame")
+	trackBar.Size = UDim2.new(1, -24, 0, 10)
+	trackBar.Position = UDim2.fromOffset(12, 34)
+	trackBar.BackgroundColor3 = T.TRACK
+	trackBar.BorderSizePixel = 0
+	trackBar.ZIndex = 3
+	trackBar.Parent = c
+	corner(trackBar, 5)
+	stroke(trackBar, T.STROKE, 1, 0.55)
+
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	fill.BorderSizePixel = 0
+	fill.ZIndex = 4
+	fill.Parent = trackBar
+	corner(fill, 5)
+	gradient(fill, T.FILL1, T.FILL2, 0)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.BackgroundColor3 = T.TEXT
+	knob.BorderSizePixel = 0
+	knob.ZIndex = 5
+	knob.Parent = trackBar
+	corner(knob, 8)
+	stroke(knob, T.ACCENT, 2, 0.2)
+
+	local function render(value)
+		local alpha = (value - min) / (max - min)
+		fill.Size = UDim2.new(alpha, 0, 1, 0)
+		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+	end
+	render(initial)
+
+	local hit = Instance.new("Frame")
+	hit.Size = UDim2.new(1, 0, 0, 28)
+	hit.Position = UDim2.fromOffset(0, 24)
+	hit.BackgroundTransparency = 1
+	hit.ZIndex = 6
+	hit.Parent = c
+
+	local dragging = false
+	local function update(x)
+		local width = trackBar.AbsoluteSize.X
+		if width <= 0 then
+			return
+		end
+		local alpha = math.clamp((x - trackBar.AbsolutePosition.X) / width, 0, 1)
+		local value = math.floor(min + alpha * (max - min) + 0.5)
+		render(value)
+		onChange(value)
+	end
+	track(hit.InputBegan:Connect(function(i)
+		if isPointer(i) then
+			dragging = true
+			body.ScrollingEnabled = false
+			update(i.Position.X)
+		end
+	end))
+	track(UIS.InputChanged:Connect(function(i)
+		if dragging and isMove(i) then
+			update(i.Position.X)
+		end
+	end))
+	track(UIS.InputEnded:Connect(function(i)
+		if dragging and isPointer(i) then
+			dragging = false
+			body.ScrollingEnabled = true
+		end
+	end))
+
+	return { label = l, box = box, render = render }
+end
+
+primaryButton("USE " .. string.upper(CONFIG.PotionName) .. "  [" .. CONFIG.PotionKey.Name .. "]", potionNow)
+
+makeToggle("AUTO STEAL", false, function(on)
+	settings.AutoSteal = on
+	setStatus(on and "auto steal armed" or "auto steal off")
+	if not on and not busy then
+		setProgress(0)
+	end
+end)
+
+makeToggle("Potion with steal", settings.PotionWithSteal, function(on)
+	settings.PotionWithSteal = on
+	save()
+end)
+
+local rangeCard
+rangeCard = sliderCard("Steal range: " .. settings.Range .. " studs", CONFIG.MinRange, CONFIG.MaxRange, settings.Range, function(value)
+	settings.Range = value
+	rangeCard.label.Text = "Steal range: " .. value .. " studs"
+	save()
+end, false)
+
+local setSpeed
+local speedCard
+speedCard = sliderCard("Walk speed", CONFIG.MinSpeed, CONFIG.MaxSpeed, settings.Speed, function(value)
+	setSpeed(value, true)
+end, true)
+
+setSpeed = function(value, fromSlider)
+	value = math.clamp(math.floor(value + 0.5), CONFIG.MinSpeed, CONFIG.MaxSpeed)
+	settings.Speed = value
+	speedCard.box.Text = tostring(value)
+	if not fromSlider then
+		speedCard.render(value)
+	end
+	applySpeed()
+	save()
+end
+track(speedCard.box.FocusLost:Connect(function()
+	setSpeed(tonumber(speedCard.box.Text) or settings.Speed)
+end))
+
+makeToggle("Speed boost", settings.SpeedEnabled, function(on)
+	settings.SpeedEnabled = on
+	if on then
+		applySpeed()
+	elseif currentHum and currentHum.Parent then
+		currentHum.WalkSpeed = CONFIG.DefaultSpeed
+	end
+	save()
+end)
+
+local hintCard = card(24)
+local hint = label(hintCard, "[" .. CONFIG.ToggleKey.Name .. "] hide / show", 10, T.DIM, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+hint.Size = UDim2.fromScale(1, 1)
+
+-- hotkeys (ignored while typing in a textbox)
+track(UIS.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == CONFIG.ToggleKey then
+		setOpen(not main.Visible)
+	elseif input.KeyCode == CONFIG.PotionKey then
+		potionNow()
+	end
+end))
+
+----------------------------------------------------------------------
+-- LOOP (speed upkeep only; auto steal runs on Heartbeat above)
+----------------------------------------------------------------------
+task.spawn(function()
+	while alive do
+		task.wait(0.25)
+		applySpeed()
+	end
+end)
